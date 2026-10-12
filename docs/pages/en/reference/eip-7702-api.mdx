@@ -31,17 +31,19 @@ The authorization carries:
 
 - `chainId`: must match the target chain.
 - `address`: the delegate contract address.
-- `nonce`: the authorization nonce (separate from the transaction nonce).
+- `nonce`: the authorizing account's nonce. If that account also sends the transaction, use its current nonce plus one, because the transaction increments the nonce before authorizations are processed.
 
 Wallets and libraries that support EIP-7702 handle the authorization format automatically.
 
 ## Tooling
 
-- **ethers.js**: `wallet.signAuthorization({ chainId, address, nonce })` produces the signed authorization for inclusion in the `authorizationList`.
-- **viem**: use `signAuthorization` with a walletClient, then pass the result to `sendTransaction`.
+- **ethers.js** (v6.14+): `wallet.authorize({ chainId, address, nonce })` produces the signed authorization for inclusion in the `authorizationList`.
+- **viem**: use `signAuthorization` with a walletClient, then pass the result to `sendTransaction`. Pass `executor: "self"` when the same account sends the transaction, and viem sets the nonce for you.
+- **Alchemy Wallet APIs**: delegate to an audited smart account and manage session keys without building the authorization yourself. See [Session keys with EIP-7702](/en/how-to/session-keys).
 - **Hardhat / Foundry**: standard EIP-7702 transaction format works when your toolchain version supports the Pectra hardfork.
 
 ## Next recommended
 
 - [**EIP-7702 concept**](/en/explanation/eip-7702): Understand the delegation model and when to use it.
-- [**Account Abstraction (EIP-7702)**](/en/reference/eip-7702-api): Implement batch payments, spending limits, and session keys step by step.
+- [**Account abstraction with EIP-7702**](/en/how-to/account-abstraction): Batch several calls into one transaction step by step.
+- [**Session keys with EIP-7702**](/en/how-to/session-keys): Grant a scoped, expiring key that sends transactions without the owner key.

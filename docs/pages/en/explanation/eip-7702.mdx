@@ -19,7 +19,7 @@ EIP-7702 lets existing EOAs execute smart contract logic without account migrati
 - **Session keys**: an EOA grants a dApp scoped, time-limited transaction permissions without exposing the owner's private key.
 
 :::note
-**Ready to implement?** See the [Account Abstraction (EIP-7702) implementation guide](/en/reference/eip-7702-api) for contract templates, authorization signing, and transaction submission.
+**Ready to implement?** See [Account abstraction with EIP-7702](/en/how-to/account-abstraction) to batch calls from a delegated EOA, or [Session keys with EIP-7702](/en/how-to/session-keys) to grant a scoped, expiring key.
 :::
 
 ## How it works
@@ -41,11 +41,13 @@ After submission, the EOA's account code is set to the delegate. Subsequent tran
 ## Security considerations
 
 - **Delegate access is total.** The delegate contract has full execution authority over the EOA for the duration of the delegation. Treat delegate selection as a trust decision: a malicious delegate can drain assets.
+- **Delegate functions are public on the EOA.** Anyone can call any external function of the delegate at the EOA's address, and it runs with the EOA's balance. A delegate that executes arbitrary calls without checking the caller, such as `Multicall3`, lets anyone drain the EOA.
 - **Delegation persists.** It does not expire at the end of a single transaction. The owner must explicitly clear or replace the delegation when they no longer want it.
 - **Gas costs are slightly higher** due to authorization processing, but this is offset when the delegate batches multiple calls. On Stable, where the base fee is 1 gwei and gas is denominated in USDT0, the additional authorization overhead stays well under a cent, comparable to a standard ERC-20 transfer in cost.
 
 ## Next recommended
 
-- [**Account Abstraction (EIP-7702)**](/en/reference/eip-7702-api): Implement batch payments, spending limits, and session keys against a delegate contract.
+- [**Account abstraction with EIP-7702**](/en/how-to/account-abstraction): Batch several calls into one atomic transaction from a delegated EOA.
+- [**Session keys with EIP-7702**](/en/how-to/session-keys): Grant a scoped, expiring key with a USDT0 allowance on an audited smart account.
 - [**USDT0 as gas**](/en/explanation/usdt-as-gas-token): Understand the gas model that EIP-7702 transactions run on.
 - [**Gas waiver**](/en/explanation/gas-waiver): Compare delegation to gas-waived flows where an application pays the user's gas instead.
