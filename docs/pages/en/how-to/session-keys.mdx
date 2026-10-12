@@ -1,0 +1,238 @@
+---
+title: "Session keys with EIP-7702"
+description: "Upgrade an EOA to a smart account with EIP-7702, grant a scoped, expiring session key, and send transactions that only the session key signs."
+diataxis: "how-to"
+---
+
+# Session keys with EIP-7702
+
+A session key is a second key that can sign for an account, limited to the permissions and expiry the owner sets. The owner key signs once to grant it. After that, an app, a backend, or an agent sends transactions with the session key, and the user doesn't approve each one.
+
+This guide uses [Alchemy Wallet APIs](https://www.alchemy.com/docs/wallets) on Stable testnet. The EOA delegates to Modular Account v2, an audited smart account, so you don't write or deploy a delegate contract.
+
+:::note
+**Concept:** For the delegation model and its security trade-offs, see [EIP-7702](/en/explanation/eip-7702).
+:::
+
+## How it works
+
+1. **Delegate the EOA.** The owner signs an EIP-7702 authorization that points the EOA at Modular Account v2. The EOA keeps its address, key, and balance.
+2. **Grant a session.** The owner signs a session grant: the session key's address, its permissions, and an expiry. Nothing is written onchain yet.
+3. **Send with the session key.** A client whose only signer is the session key sends calls for the owner's account. The first call installs the session onchain.
+
+## Prerequisites
+
+- Node 22 or later.
+- An [Alchemy](https://dashboard.alchemy.com/?utm_source=chain_partner&utm_medium=referral&utm_campaign=stable) app with Stable testnet enabled, and its API key.
+- Optional: an Alchemy Gas Manager policy ID. With a policy, Alchemy sponsors gas. Without one, the EOA pays gas in USDT0 and needs a [testnet balance](/en/how-to/use-faucet).
+
+```bash
+npm install @alchemy/wallet-apis viem
+```
+
+```text
+added 2 packages
+```
+
+## Step 1: Configure the clients
+
+Create one client signed by the owner. Wallet APIs run in EIP-7702 mode by default, so the owner's EOA address is the smart account address.
+
+```typescript
+// config.ts
+import { alchemyWalletTransport, createSmartWalletClient } from "@alchemy/wallet-apis";
+import { createPublicClient, http, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { stableTestnet } from "viem/chains";
+
+export const chain = stableTestnet;
+export const transport = alchemyWalletTransport({ apiKey: process.env.ALCHEMY_API_KEY! });
+export const paymaster = process.env.ALCHEMY_GAS_POLICY_ID
+  ? { policyId: process.env.ALCHEMY_GAS_POLICY_ID }
+  : undefined;
+
+export const USDT0_ADDRESS = "0x78Cf24370174180738C5B8E352B6D14c83a6c9A9";
+
+export const owner = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY as Hex);
+export const account = owner.address;
+
+export const ownerClient = createSmartWalletClient({ transport, chain, signer: owner, paymaster });
+export const publicClient = createPublicClient({ chain, transport: http() });
+```
+
+## Step 2: Delegate the EOA
+
+A session can only be installed on an account that is already delegated. Send an empty call set: Wallet APIs detect the missing delegation and submit the EIP-7702 authorization in the same transaction.
+
+```typescript
+// delegate.ts
+import { account, ownerClient, publicClient } from "./config";
+
+// Delegated EOAs carry the code 0xef0100 || delegate address.
+const code = await publicClient.getCode({ address: account });
+
+if (code?.startsWith("0xef0100")) {
+  console.log("already delegated to", `0x${code.slice(8)}`);
+} else {
+  const { id } = await ownerClient.sendCalls({ calls: [] });
+  const status = await ownerClient.waitForCallsStatus({ id });
+  if (status.status !== "success") throw new Error("delegation failed");
+  console.log("delegated in tx", status.receipts?.[0]?.transactionHash);
+}
+```
+
+```text
+delegated in tx 0x...
+```
+
+:::warning
+Wallet APIs accept only Modular Account v2 (`SemiModularAccount7702`) as the delegate. If the EOA is already delegated to another contract, the call fails. [Clear the delegation](#clear-the-delegation) first.
+:::
+
+## Step 3: Grant a scoped session key
+
+Generate the session key and grant it the narrowest permissions that cover your use case. This example lets the key transfer up to 10 USDT0 for one hour.
+
+```typescript
+// grant.ts
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { parseUnits } from "viem";
+import { account, ownerClient, USDT0_ADDRESS } from "./config";
+
+// Store this key wherever the app or agent that uses it runs.
+export const sessionKey = privateKeyToAccount(generatePrivateKey());
+const expirySec = Math.floor(Date.now() / 1000) + 60 * 60;
+
+export const permissions = await ownerClient.grantPermissions({
+  account,
+  expirySec,
+  key: { publicKey: sessionKey.address, type: "secp256k1" },
+  permissions: [
+    {
+      type: "erc20-token-transfer",
+      data: { address: USDT0_ADDRESS, allowance: parseUnits("10", 6) },
+    },
+  ],
+});
+
+console.log("session key", sessionKey.address);
+console.log("expires    ", new Date(expirySec * 1000).toISOString());
+```
+
+```text
+session key 0x...
+expires     2026-10-12T13:00:00.000Z
+```
+
+`permissions.context` is the proof of the grant. Pass it with every call the session key sends.
+
+If no gas policy sponsors gas, the session key's transactions pay gas from the account's USDT0. Add a `gas-limit` permission to cap that spend.
+
+### Permission types
+
+| **Type** | **`data`** | **Grants** |
+| :--- | :--- | :--- |
+| `erc20-token-transfer` | `address`, `allowance` | `transfer` and `approve` on one ERC-20 token, up to `allowance` in total |
+| `native-token-transfer` | `allowance` | Native-value transfers up to `allowance` in total |
+| `gas-limit` | `limit` | Gas the session key can spend from the account |
+| `contract-access` | `address` | Every function on one contract |
+| `functions-on-contract` | `address`, `functions` | Listed function selectors on one contract |
+| `functions-on-all-contracts` | `functions` | Listed function selectors on any contract |
+| `account-functions` | `functions` | Listed function selectors on the account itself |
+| `root` | none | Everything the owner can do, until expiry |
+
+:::warning
+**USDT0 is both the native token and an ERC-20 on Stable, with one shared balance.** An `erc20-token-transfer` allowance on USDT0 does not cap native-value transfers, and a `native-token-transfer` allowance moves the same USDT0. Native amounts use 18 decimals and the ERC-20 uses 6. Grant only the one your app uses.
+:::
+
+:::danger
+Never grant `root` outside a test. A `root` session key can drain the account and change its configuration until it expires.
+:::
+
+## Step 4: Send a transaction with the session key
+
+Create a second client whose only signer is the session key, acting for the owner's account. The owner key is not used from here on.
+
+```typescript
+// send.ts
+import { createSmartWalletClient } from "@alchemy/wallet-apis";
+import { encodeFunctionData, erc20Abi, parseUnits } from "viem";
+import { account, chain, paymaster, transport, USDT0_ADDRESS } from "./config";
+import { permissions, sessionKey } from "./grant";
+
+const sessionClient = createSmartWalletClient({ transport, chain, signer: sessionKey, account, paymaster });
+
+const { id } = await sessionClient.sendCalls({
+  calls: [
+    {
+      to: USDT0_ADDRESS,
+      data: encodeFunctionData({
+        abi: erc20Abi,
+        functionName: "transfer",
+        args: ["0xRecipient...", parseUnits("1", 6)],
+      }),
+    },
+  ],
+  capabilities: { permissions },
+});
+
+const status = await sessionClient.waitForCallsStatus({ id });
+if (status.status !== "success") throw new Error("session-key call failed");
+console.log("sent in tx", status.receipts?.[0]?.transactionHash);
+```
+
+```text
+sent in tx 0x...
+```
+
+A call outside the granted permissions fails and moves no funds. Examples: a transfer that exceeds the remaining allowance, or a transfer of another token.
+
+## End a session
+
+A session stops working at its `expirySec`. Keep expiries short and grant a new session when the old one ends.
+
+### Clear the delegation
+
+To remove the smart account entirely, the owner re-delegates the EOA to the zero address. The EOA sends this transaction itself and pays gas in USDT0.
+
+```typescript
+// undelegate.ts
+import { createWalletClient, http, zeroAddress } from "viem";
+import { chain, owner } from "./config";
+
+const walletClient = createWalletClient({ account: owner, chain, transport: http() });
+
+const authorization = await walletClient.signAuthorization({
+  contractAddress: zeroAddress,
+  executor: "self", // the EOA sends the transaction, so the authorization nonce is its nonce + 1
+});
+
+const hash = await walletClient.sendTransaction({
+  to: owner.address,
+  authorizationList: [authorization],
+  maxPriorityFeePerGas: 0n,
+});
+console.log("delegation cleared in tx", hash);
+```
+
+```text
+delegation cleared in tx 0x...
+```
+
+If your Alchemy plan includes a sponsorship policy for undelegation, `ownerClient.undelegateAccount()` sends the same reset with gas sponsored.
+
+:::note
+Clearing the delegation does not erase the account's storage. If the EOA delegates to Modular Account v2 again, sessions that haven't expired become valid again.
+:::
+
+## Considerations
+
+- **The session key is a credential.** Anyone who holds it can act within its permissions until expiry. Store it like any other private key.
+- **Delegation persists.** The EOA runs Modular Account v2 until the owner clears or replaces the delegation. Test with a key you're willing to upgrade.
+- **One delegate per EOA.** Delegating to another contract, such as a [subscription manager](/en/how-to/subscribe-and-collect), replaces Modular Account v2 and disables its sessions.
+
+## Next recommended
+
+- [**EIP-7702 concept**](/en/explanation/eip-7702): Understand the delegation model and its security trade-offs before you ship.
+- [**Account abstraction with EIP-7702**](/en/how-to/account-abstraction): Batch several calls into one transaction from a delegated EOA.
+- [**EIP-7702 reference**](/en/reference/eip-7702-api): Look up the type-4 transaction format and authorization fields.

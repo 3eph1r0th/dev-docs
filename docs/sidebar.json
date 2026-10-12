@@ -199,6 +199,10 @@
               "link": "/en/how-to/account-abstraction"
             },
             {
+              "text": "Session Keys",
+              "link": "/en/how-to/session-keys"
+            },
+            {
               "text": "Eip 7702 Api",
               "link": "/en/reference/eip-7702-api"
             }
