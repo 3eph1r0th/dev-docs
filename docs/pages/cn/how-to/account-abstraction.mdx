@@ -1,62 +1,88 @@
 ---
 source_path: how-to/account-abstraction.mdx
-source_sha: 30e0b565660c81e67967daa2ddf0f0ceae7aa9ef
+source_sha: dc092f193edb6580d8d52328aed4c01f79a0a312
 title: "使用 EIP-7702 实现账户抽象"
-description: "通过将现有 EOA 委托给 EIP-7702 智能合约，实现批量支付、消费限额和会话密钥。"
+description: "通过将现有 EOA 委托给 EIP-7702 智能合约，将多个调用批量处理为一笔原子交易。"
 diataxis: "how-to"
 ---
 
 # 使用 EIP-7702 实现账户抽象
 
-本指南将通过 EIP-7702 应用于 EOA，并使用委托实现三种模式：批量支付、消费限额和会话密钥。在此过程中，EOA 保持其地址和私钥不变。
+本指南将 EIP-7702 应用于 EOA，并使用委托将多个 USDT0 传输批量处理为一笔原子交易。EOA 在整个过程中保持其地址和私钥不变。对于会话密钥和消费限额，请参阅[使用 EIP-7702 的会话密钥](/cn/how-to/session-keys)，该密钥使用经过审计的智能账户而不是自定义委托。
 
 :::note
-**概念：** 有关 EIP-7702 在 Stable 上能实现的功能以及安全方面的考量，请参阅[EIP-7702](/cn/explanation/eip-7702)。
+**概念：** 有关 EIP-7702 在 Stable 上实现的功能以及安全注意事项，请参阅 [EIP-7702](/cn/explanation/eip-7702)。
 :::
 
 ## 先决条件
 
-- 了解 EOA 与智能合约账户的区别（EOA 默认不包含代码）。
+- 了解 EOA 与智能合约账户（EOA 默认没有代码）。
 - 熟悉 EVM 交易类型（[EIP-2718](https://eips.ethereum.org/EIPS/eip-2718)）。
+- [Foundry](https://book.getfoundry.sh/getting-started/installation) 用于部署委托合约。
 
-## 概述
+## 概览
 
-EIP-7702 引入了一种新的交易类型（`0x04`），它携带一个 `authorizationList`。每个授权都指定了一个智能合约，EOA 将在该交易中执行该智能合约的代码。流程如下：
+EIP-7702 引入了一种新的交易类型（`0x04`），它包含一个 `authorizationList`。每个授权都指定一个智能合约，EOA 执行该智能合约的代码。流程如下：
 
-1.  **选择或部署委托合约**：一个标准的 Solidity 合约，实现了您希望 EOA 使用的逻辑。您可以使用已部署的合约或部署自己的合约。尽可能使用经过审计的合约。
+1.  **选择或部署委托合约**：一个标准的 Solidity 合约，实现您希望 EOA 使用的逻辑。尽可能使用经过审计的合约。
 2.  **签署授权**：EOA 所有者签署一条消息，授权委托合约。
 3.  **提交 EIP-7702 交易**：交易包含授权，EOA 在执行期间运行委托的代码。
 
+:::danger
+**委托上的每个外部函数都可以被任何人通过 EOA 调用。** 调用以 EOA 的余额和身份运行。如果委托在不检查调用者的情况下进行任意调用，那么任何地址都可以耗尽 EOA 的资金。这排除了 `Multicall3` 等通用合约作为委托。保护每个更改状态的函数，例如使用 `require(msg.sender == address(this))`。
+:::
+
 ## 用例：批量交易
 
-以下步骤将使用 `Multicall3` 作为委托合约来演示此流程。`Multicall3` 是一个广泛部署的实用合约，它将多个调用聚合到一个交易中。通过将 `Multicall3` 指定为 EIP-7702 委托，EOA 可以将任意合约交互（代币转账、批准、合约读取或任意组合）批量处理为一笔原子交易。批量支付就是一个例子：EOA 无需为一次工资支付发送十笔单独的交易，而是可以一次性执行所有交易。
+批量处理将多个调用（代币传输、批准或任何组合）在一个原子交易中运行。批量支付就是一个例子：EOA 不会为工资发放发送十笔单独的交易，而是同时执行所有交易。
 
-### 步骤 1：使用 Multicall3 作为委托合约
+### 步骤 1：部署批量执行器
 
-`Multicall3` 部署在 Stable 上的 `0xcA11bde05977b3631167028862bE2a173976CA11`。由于它已经部署并且被广泛使用，您无需部署自己的委托。签署 EIP-7702 授权会授予委托对您的 EOA 的完全执行权限。
+`BatchExecutor` 按顺序运行一系列调用，如果任何调用失败，则回滚整个批次。它只接受来自 EOA 本身的调用，因此只有所有者的密钥才能触发批次。
 
 ```solidity
-// Multicall3 interface (relevant functions only)
-interface IMulticall3 {
-    struct Call3 {
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title BatchExecutor (example, unaudited)
+/// @notice EIP-7702 delegate that executes a batch of calls from the EOA.
+contract BatchExecutor {
+    struct Call {
         address target;
-        bool allowFailure;
-        bytes callData;
-    }
-    struct Result {
-        bool success;
-        bytes returnData;
+        uint256 value;
+        bytes data;
     }
 
-    /// @notice Aggregate calls, allowing each to succeed or fail independently
-    function aggregate3(Call3[] calldata calls)
-        external payable returns (Result[] memory returnData);
+    function execute(Call[] calldata calls) external payable {
+        // SAFE: only the EOA itself, signing with its own key, can run a batch.
+        require(msg.sender == address(this), "only self");
+
+        for (uint256 i = 0; i < calls.length; i++) {
+            (bool success,) = calls[i].target.call{value: calls[i].value}(calls[i].data);
+            require(success, "call failed");
+        }
+    }
 }
+```
+
+部署一次。任意数量的 EOA 都可以委托给同一个部署。
+
+```bash
+forge create src/BatchExecutor.sol:BatchExecutor \
+  --rpc-url https://rpc.testnet.stable.xyz \
+  --private-key $PRIVATE_KEY \
+  --broadcast
+```
+
+```text
+Deployer: 0xYourAddress...
+Deployed to: 0xBatchExecutor...
+Transaction hash: 0x...
 ```
 
 ### 步骤 2：签署授权
 
-EOA 所有者签署一份授权，指定委托合约。此授权将包含在 EIP-7702 交易中。
+EOA 所有者签署一份指定委托合约的授权。此授权包含在 EIP-7702 交易中。
 
 ```javascript
 // config.ts
@@ -65,7 +91,7 @@ import { ethers } from "ethers";
 export const STABLE_TESTNET_RPC = "https://rpc.testnet.stable.xyz";
 export const STABLE_TESTNET_CHAIN_ID = 2201;
 export const USDT0_ADDRESS = "0x78Cf24370174180738C5B8E352B6D14c83a6c9A9";
-export const DELEGATE_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+export const DELEGATE_ADDRESS = "0xBatchExecutor..."; // from Step 1
 
 export const provider = new ethers.JsonRpcProvider(STABLE_TESTNET_RPC);
 export const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
@@ -73,23 +99,28 @@ export const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
 ```javascript
 // signAuthorization.ts
-import { ethers } from "ethers";
 import { DELEGATE_ADDRESS, STABLE_TESTNET_CHAIN_ID, provider, wallet } from "./config";
 
 export async function signAuthorization() {
-  const authorization = {
+  const txNonce = await provider.getTransactionCount(wallet.address);
+
+  return wallet.authorize({
     chainId: STABLE_TESTNET_CHAIN_ID,
     address: DELEGATE_ADDRESS,
-    nonce: await provider.getTransactionCount(wallet.address),
-  };
-
-  return wallet.signAuthorization(authorization);
+    // The EOA sends this transaction itself. Its nonce increments before the
+    // authorization is checked, so the authorization must use the next nonce.
+    nonce: txNonce + 1,
+  });
 }
 ```
 
+:::warning
+如果 EOA 提交自己的 EIP-7702 交易，则授权 nonce 必须是账户当前 nonce **加一**。如果使用当前 nonce，授权将被跳过，不会设置委托，交易仍会成功而不会运行批处理。当您将 `executor: "self"` 传递给 `signAuthorization` 时，viem 会处理此问题。
+:::
+
 ### 步骤 3：提交 EIP-7702 交易
 
-将授权与对 `Multicall3.aggregate3` 的调用结合起来。此示例将三个 USDT0 转账批处理到一个交易中。
+将授权与对 `execute` 的调用结合起来。此示例在一个交易中批量处理三个 USDT0 传输。
 
 ```javascript
 import { ethers } from "ethers";
@@ -101,7 +132,7 @@ const usdt0Interface = new ethers.Interface([
 ]);
 
 const batchInterface = new ethers.Interface([
-  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) returns ((bool success, bytes returnData)[])",
+  "function execute((address target, uint256 value, bytes data)[] calls)",
 ]);
 
 async function main() {
@@ -111,11 +142,11 @@ async function main() {
     { to: "0xCarol...", amount: ethers.parseUnits("150", 6) },
   ];
 
-  const batchData = batchInterface.encodeFunctionData("aggregate3", [
+  const batchData = batchInterface.encodeFunctionData("execute", [
     recipients.map(({ to, amount }) => ({
       target: USDT0_ADDRESS,
-      allowFailure: false,
-      callData: usdt0Interface.encodeFunctionData("transfer", [to, amount]),
+      value: 0n,
+      data: usdt0Interface.encodeFunctionData("transfer", [to, amount]),
     })),
   ]);
 
@@ -124,7 +155,7 @@ async function main() {
   const tx = await wallet.sendTransaction({
     type: 4,                          // EIP-7702 transaction type
     to: wallet.address,               // call is directed at the EOA itself
-    data: batchData,                  // aggregate3 call to execute
+    data: batchData,                  // execute() call to run
     authorizationList: [signedAuth],
     maxPriorityFeePerGas: 0n,
   });
@@ -132,140 +163,41 @@ async function main() {
   const receipt = await tx.wait(1);
   console.log("Batch transactions executed in tx:", receipt.hash);
 }
+
+main();
 ```
 
 ```text
 Batch transactions executed in tx: 0x...
 ```
 
-EOA 通过 `Multicall3.aggregate3` 在一个原子交易中执行所有三个调用。委托将持续存在，直到明确更改或清除。虽然此示例展示了批量支付，但相同的模式适用于任何合约调用组合。
+EOA 在一个原子交易中执行所有三个传输。委托会持续存在，因此后续批次只需向 `wallet.address` 发送常规交易，其中包含 `execute` calldata 且没有 `authorizationList`。
 
-## 用例：消费限额
+## 消费限额和会话密钥
 
-委托合约可以强制对 EOA 实行每笔交易或每日限额，而无需进行账户迁移。
+消费限额和会话密钥允许第二个密钥在所有者设定的规则内为 EOA 操作。使用经过审计的智能账户而不是自定义委托：
 
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+-   **访问控制是整个功能。** 自定义委托中遗漏的调用者检查会将 EOA 暴露给任何人，而不仅仅是会话密钥。
+-   **存储比委托更持久。** 委托状态存在于 EOA 的存储中。重新委托给具有不同存储布局的合约可能会误读或覆盖它。
 
-/// @title SpendingLimitExecutor
-/// @notice Delegate contract that enforces daily spending caps
-contract SpendingLimitExecutor {
-    mapping(address => uint256) public dailyLimit;
-    mapping(address => uint256) public spentToday;
-    mapping(address => uint256) public lastResetDay;
-
-    function setDailyLimit(uint256 limit) external {
-        dailyLimit[msg.sender] = limit;
-    }
-
-    function executeWithLimit(
-        address target,
-        uint256 value,
-        bytes calldata data
-    ) external payable {
-        uint256 today = block.timestamp / 1 days;
-
-        if (today > lastResetDay[msg.sender]) {
-            spentToday[msg.sender] = 0;
-            lastResetDay[msg.sender] = today;
-        }
-
-        spentToday[msg.sender] += value;
-        require(
-            spentToday[msg.sender] <= dailyLimit[msg.sender],
-            "daily limit exceeded"
-        );
-
-        (bool success,) = target.call{value: value}(data);
-        require(success, "call failed");
-    }
-}
-```
-
-## 用例：会话密钥
-
-会话密钥允许 dApp 在具有限定权限（时间窗口和允许的目标合约集）的情况下代表 EOA 执行交易。这对于需要频繁链上交互的 dApp 很有用，否则会需要重复的钱包批准。
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
-
-/// @title SessionKeyExecutor
-/// @notice Delegate contract that grants scoped, time-limited access to a session key
-contract SessionKeyExecutor {
-    struct Session {
-        address key;
-        uint256 validUntil;
-        uint256 spendingLimit;
-        uint256 spent;
-    }
-
-    mapping(address => Session) public sessions;
-    mapping(address => mapping(address => bool)) public allowedTargets;
-
-    /// @notice Register a session key with scoped permissions
-    function startSession(
-        address key,
-        uint256 validUntil,
-        uint256 spendingLimit,
-        address[] calldata targets
-    ) external {
-        sessions[msg.sender] = Session({
-            key: key,
-            validUntil: validUntil,
-            spendingLimit: spendingLimit,
-            spent: 0
-        });
-
-        for (uint256 i = 0; i < targets.length; i++) {
-            allowedTargets[msg.sender][targets[i]] = true;
-        }
-    }
-
-    /// @notice Execute a call using the session key
-    function executeAsSessionKey(
-        address owner,
-        address target,
-        uint256 value,
-        bytes calldata data
-    ) external {
-        Session storage session = sessions[owner];
-
-        require(msg.sender == session.key, "not session key");
-        require(block.timestamp <= session.validUntil, "session expired");
-        require(allowedTargets[owner][target], "target not allowed");
-
-        uint256 beforeBalance = owner.balance;
-
-        (bool success,) = target.call{value: value}(data);
-        require(success, "call failed");
-
-        session.spent += owner.balance - beforeBalance;
-        require(session.spent <= session.spendingLimit, "budget exceeded");
-    }
-
-    /// @notice Revoke the active session
-    function revokeSession() external {
-        delete sessions[msg.sender];
-    }
-}
-```
+[使用 EIP-7702 的会话密钥](/cn/how-to/session-keys) 将 EOA 委托给 Modular Account v2 并授予密钥过期的 USDT0 限额。该限额就是消费限额。
 
 ## 重要注意事项
 
--   **持久委托**：委托将一直持续，直到 EOA 明确更改或清除它。它不限于单笔交易。
--   **gas 成本**：EIP-7702 交易由于授权处理，基础 gas 费略高，但当委托批量处理多个调用时，可以抵消这部分成本。
--   **使用经过审计的委托**：恶意的委托合约可能会耗尽 EOA 的资产。仅委托给经过审计的合约。
+-   **持久委托**：委托会持续存在，直到 EOA 明确更改或清除它。它不限于单个交易。
+-   **Gas 成本**：由于授权处理，EIP-7702 交易的基本 Gas 略高，当委托批量处理多个调用时，这会得到抵消。
+-   **使用经过审计的委托**：恶意或不受保护的委托合约可能会耗尽 EOA 的资产。上面的 `BatchExecutor` 是一个未经审计的示例。在生产中只委托给经过审计的合约。
 
 ## 主要收获
 
 -   EIP-7702 允许 EOA 执行智能合约逻辑，而无需迁移到新的账户类型。
--   在 Stable 上，EIP-7702 使得现有 EOA 能够实现批量支付、消费限额和受限会话密钥。
--   委托将持续存在，直到明确更改。始终使用经过审计的委托合约。
+-   在 Stable 上，EIP-7702 允许在现有 EOA 上进行批量支付、消费限额和范围会话密钥。
+-   委托上的每个函数都可以被任何人通过 EOA 调用，因此委托必须检查调用者。
+-   委托会持续存在，直到明确更改。始终使用经过审计的委托合约。
 
 ## 接下来推荐
 
--   [**订阅与收款**](/cn/how-to/subscribe-and-collect)：将 EIP-7702 应用于使用 SubscriptionManager 的定期订阅支付。
+-   [**使用 EIP-7702 的会话密钥**](/cn/how-to/session-keys)：授予一个有范围的、过期的密钥，可以在没有所有者密钥的情况下发送交易。
+-   [**订阅和收集**](/cn/how-to/subscribe-and-collect)：将 EIP-7702 应用于使用 SubscriptionManager 的定期订阅支付。
 -   [**EIP-7702 概念**](/cn/explanation/eip-7702)：在发布之前了解委托模型。
--   [**EIP-7702 参考资料**](/cn/reference/eip-7702-api)：查找 `0x04` 交易格式和授权字段。
+-   [**EIP-7702 参考**](/cn/reference/eip-7702-api)：查找 `0x04` 交易格式和授权字段。
