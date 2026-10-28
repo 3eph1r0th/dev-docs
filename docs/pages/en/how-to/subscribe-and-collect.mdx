@@ -204,13 +204,15 @@ The subscriber signs an EIP-7702 authorization to delegate their EOA to the `Sub
 // delegate.ts
 import { subscriberWallet, provider, CHAIN_ID, SUBSCRIPTION_MANAGER } from "./config";
 
-const authorization = {
+// The subscriber sends this transaction itself, so the authorization must use
+// the next nonce: the account nonce increments before authorizations are checked.
+const txNonce = await provider.getTransactionCount(subscriberWallet.address);
+
+const signedAuth = await subscriberWallet.authorize({
   chainId: CHAIN_ID,
   address: SUBSCRIPTION_MANAGER,
-  nonce: await provider.getTransactionCount(subscriberWallet.address),
-};
-
-const signedAuth = await subscriberWallet.signAuthorization(authorization);
+  nonce: txNonce + 1,
+});
 
 const tx = await subscriberWallet.sendTransaction({
   type: 4,
@@ -385,5 +387,6 @@ The subscriber is authorizing the delegate contract to pull funds from their EOA
 ## Next recommended
 
 - [**Subscription billing concept**](/en/reference/subscriptions): Understand the pull-based billing model.
-- [**Account abstraction**](/en/how-to/account-abstraction): See how batch payments, spending limits, and session keys combine under one delegation.
+- [**Account abstraction**](/en/how-to/account-abstraction): Batch several calls into one transaction from a delegated EOA.
+- [**Session keys**](/en/how-to/session-keys): Grant a scoped, expiring key on an audited smart account.
 - [**EIP-7702 concept**](/en/explanation/eip-7702): Review the delegation model that makes this possible.

@@ -1,0 +1,240 @@
+---
+source_path: how-to/session-keys.mdx
+source_sha: 0f0a139b277411c12dac9c2377e65453c617162f
+title: "使用 EIP-7702 的会话密钥"
+description: "使用 EIP-7702 将 EOA 升级为智能账户，授予一个有时效性、有范围的会话密钥，并发送仅由该会话密钥签名的交易。"
+diataxis: "how-to"
+---
+
+# 使用 EIP-7702 的会话密钥
+
+会话密钥是第二个可以为账户签名的密钥，其权限和有效期由所有者设置。所有者密钥只需签署一次即可授予权限。之后，应用程序、后端或代理即可使用会话密钥发送交易，用户无需批准每笔交易。
+
+本指南在 Stable 测试网上使用 [Alchemy Wallet APIs](https://www.alchemy.com/docs/wallets)。EOA 委托给 Modular Account v2，这是一个经过审计的智能账户，因此您无需编写或部署委托合约。
+
+:::note
+**概念：** 有关委托模型及其安全权衡，请参阅 [EIP-7702](/cn/explanation/eip-7702)。
+:::
+
+## 工作原理
+
+1. **委托 EOA。** 所有者签署一份 EIP-7702 授权，将 EOA 指向 Modular Account v2。EOA 保留其地址、密钥和余额。
+2. **授予会话。** 所有者签署一份会话授予：会话密钥的地址、其权限和有效期。此时链上尚未写入任何内容。
+3. **使用会话密钥发送。** 一个仅以会话密钥作为签名的客户端为所有者的账户发送调用。第一个调用会在链上安装会话。
+
+## 先决条件
+
+- Node 22 或更高版本。
+- 一个已启用 Stable 测试网的 [Alchemy](https://dashboard.alchemy.com/?utm_source=chain_partner&utm_medium=referral&utm_campaign=stable) 应用程序，及其 API 密钥。
+- 可选：一个 Alchemy Gas Manager 策略 ID。使用策略，Alchemy 会赞助 Gas。如果没有策略，EOA 将以 USDT0 支付 Gas，并需要一个[测试网余额](/cn/how-to/use-faucet)。
+
+```bash
+npm install @alchemy/wallet-apis viem
+```
+
+```text
+added 2 packages
+```
+
+## 步骤 1：配置客户端
+
+创建一个由所有者签名的客户端。Wallet API 默认以 EIP-7702 模式运行，因此所有者的 EOA 地址就是智能账户地址。
+
+```typescript
+// config.ts
+import { alchemyWalletTransport, createSmartWalletClient } from "@alchemy/wallet-apis";
+import { createPublicClient, http, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { stableTestnet } from "viem/chains";
+
+export const chain = stableTestnet;
+export const transport = alchemyWalletTransport({ apiKey: process.env.ALCHEMY_API_KEY! });
+export const paymaster = process.env.ALCHEMY_GAS_POLICY_ID
+  ? { policyId: process.env.ALCHEMY_GAS_POLICY_ID }
+  : undefined;
+
+export const USDT0_ADDRESS = "0x78Cf24370174180738C5B8E352B6D14c83a6c9A9";
+
+export const owner = privateKeyToAccount(process.env.OWNER_PRIVATE_KEY as Hex);
+export const account = owner.address;
+
+export const ownerClient = createSmartWalletClient({ transport, chain, signer: owner, paymaster });
+export const publicClient = createPublicClient({ chain, transport: http() });
+```
+
+## 步骤 2：委托 EOA
+
+会话只能安装在已委托的账户上。发送一个空的调用集：Wallet API 会检测到缺失的委托，并在同一笔交易中提交 EIP-7702 授权。
+
+```typescript
+// delegate.ts
+import { account, ownerClient, publicClient } from "./config";
+
+// Delegated EOAs carry the code 0xef0100 || delegate address.
+const code = await publicClient.getCode({ address: account });
+
+if (code?.startsWith("0xef0100")) {
+  console.log("already delegated to", `0x${code.slice(8)}`);
+} else {
+  const { id } = await ownerClient.sendCalls({ calls: [] });
+  const status = await ownerClient.waitForCallsStatus({ id });
+  if (status.status !== "success") throw new Error("delegation failed");
+  console.log("delegated in tx", status.receipts?.[0]?.transactionHash);
+}
+```
+
+```text
+delegated in tx 0x...
+```
+
+:::warning
+Wallet API 仅接受 Modular Account v2 (`SemiModularAccount7702`) 作为委托人。如果 EOA 已委托给其他合约，则调用将失败。请先[清除委托](#clear-the-delegation)。
+:::
+
+## 步骤 3：授予有范围的会话密钥
+
+生成会话密钥并授予最窄的权限，以满足您的用例。此示例允许该密钥在一小时内转移最多 10 个 USDT0。
+
+```typescript
+// grant.ts
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { parseUnits } from "viem";
+import { account, ownerClient, USDT0_ADDRESS } from "./config";
+
+// Store this key wherever the app or agent that uses it runs.
+export const sessionKey = privateKeyToAccount(generatePrivateKey());
+const expirySec = Math.floor(Date.now() / 1000) + 60 * 60;
+
+export const permissions = await ownerClient.grantPermissions({
+  account,
+  expirySec,
+  key: { publicKey: sessionKey.address, type: "secp256k1" },
+  permissions: [
+    {
+      type: "erc20-token-transfer",
+      data: { address: USDT0_ADDRESS, allowance: parseUnits("10", 6) },
+    },
+  ],
+});
+
+console.log("session key", sessionKey.address);
+console.log("expires    ", new Date(expirySec * 1000).toISOString());
+```
+
+```text
+session key 0x...
+expires     2026-10-12T13:00:00.000Z
+```
+
+`permissions.context` 是授予的证明。会话密钥发送的每次调用都应传递它。
+
+如果没有 Gas 策略赞助 Gas，会话密钥的交易将从账户的 USDT0 中支付 Gas。添加 `gas-limit` 权限以限制该支出。
+
+### 权限类型
+
+| **类型**                 | **`data`**              | **授予**                                        |
+| :----------------------- | :---------------------- | :---------------------------------------------- |
+| `erc20-token-transfer`   | `address`, `allowance`  | 对一个 ERC-20 代币进行 `transfer` 和 `approve`，总计不超过 `allowance` |
+| `native-token-transfer`  | `allowance`             | 本地值转移，总计不超过 `allowance`                 |
+| `gas-limit`              | `limit`                 | 会话密钥可以从账户中花费的 Gas                |
+| `contract-access`        | `address`               | 某个合约上的所有函数                              |
+| `functions-on-contract`  | `address`, `functions`  | 某个合约上列出的函数选择器                      |
+| `functions-on-all-contracts` | `functions`             | 任何合约上列出的函数选择器                      |
+| `account-functions`      | `functions`             | 账户本身上列出的函数选择器                      |
+| `root`                   | none                    | 所有者可以做的所有事情，直到过期                  |
+
+:::warning
+**USDT0 在 Stable 上既是原生代币又是 ERC-20，共享一个余额。** USDT0 上的 `erc20-token-transfer` 额度不限制原生值转账，`native-token-transfer` 额度移动的是相同的 USDT0。原生金额使用 18 位小数，ERC-20 使用 6 位。仅授予您的应用程序使用的那个。
+:::
+
+:::danger
+除非在测试中，否则绝不要授予 `root` 权限。一个 `root` 会话密钥可以在过期前耗尽账户并更改其配置。
+:::
+
+## 步骤 4：使用会话密钥发送交易
+
+创建第二个客户端，其唯一的签名者是会话密钥，代表所有者的账户操作。所有者密钥从此处开始不再使用。
+
+```typescript
+// send.ts
+import { createSmartWalletClient } from "@alchemy/wallet-apis";
+import { encodeFunctionData, erc20Abi, parseUnits } from "viem";
+import { account, chain, paymaster, transport, USDT0_ADDRESS } from "./config";
+import { permissions, sessionKey } from "./grant";
+
+const sessionClient = createSmartWalletClient({ transport, chain, signer: sessionKey, account, paymaster });
+
+const { id } = await sessionClient.sendCalls({
+  calls: [
+    {
+      to: USDT0_ADDRESS,
+      data: encodeFunctionData({
+        abi: erc20Abi,
+        functionName: "transfer",
+        args: ["0xRecipient...", parseUnits("1", 6)],
+      }),
+    },
+  ],
+  capabilities: { permissions },
+});
+
+const status = await sessionClient.waitForCallsStatus({ id });
+if (status.status !== "success") throw new Error("session-key call failed");
+console.log("sent in tx", status.receipts?.[0]?.transactionHash);
+```
+
+```text
+sent in tx 0x...
+```
+
+超出所授予权限的调用将失败，并且不会转移任何资金。例如：超出剩余限额的转账，或转账其他代币。
+
+## 结束会话
+
+会话在其 `expirySec` 时停止工作。保持有效期较短，并在旧会话结束时授予新会话。
+
+### 清除委托
+
+要完全移除智能账户，所有者将 EOA 重新委托给零地址。EOA 自己发送此交易，并以 USDT0 支付 Gas。
+
+```typescript
+// undelegate.ts
+import { createWalletClient, http, zeroAddress } from "viem";
+import { chain, owner } from "./config";
+
+const walletClient = createWalletClient({ account: owner, chain, transport: http() });
+
+const authorization = await walletClient.signAuthorization({
+  contractAddress: zeroAddress,
+  executor: "self", // the EOA sends the transaction, so the authorization nonce is its nonce + 1
+});
+
+const hash = await walletClient.sendTransaction({
+  to: owner.address,
+  authorizationList: [authorization],
+  maxPriorityFeePerGas: 0n,
+});
+console.log("delegation cleared in tx", hash);
+```
+
+```text
+delegation cleared in tx 0x...
+```
+
+如果您的 Alchemy 计划包含针对解除委托的赞助策略，`ownerClient.undelegateAccount()` 会发送相同的重置操作，并由赞助的 Gas 支付。
+
+:::note
+清除委托不会擦除账户的存储。如果 EOA 再次委托给 Modular Account v2，尚未过期的会话将再次生效。
+:::
+
+## 考量因素
+
+- **会话密钥是一种凭证。** 任何持有它的人都可以在其权限范围内行事，直到过期。像存储其他私钥一样存储它。
+- **委托是持久的。** EOA 运行 Modular Account v2，直到所有者清除或替换委托。使用您愿意升级的密钥进行测试。
+- **每个 EOA 一个委托。** 委托给另一个合约，例如[订阅管理器](/cn/how-to/subscribe-and-collect)，会替换 Modular Account v2 并禁用其会话。
+
+## 下一步建议
+
+- [**EIP-7702 概念**](/cn/explanation/eip-7702)：在发布之前了解委托模型及其安全权衡。
+- [**使用 EIP-7702 实现账户抽象**](/cn/how-to/account-abstraction)：将多个调用批量处理到一个委托 EOA 的交易中。
+- [**EIP-7702 参考**](/cn/reference/eip-7702-api)：查找类型 4 交易格式和授权字段。
